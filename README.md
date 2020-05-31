@@ -1,2 +1,2 @@
-# x-ray
-Data Analysis Scripts and Dashboards
+# my-r-scripts
+My own tools and code snippets in R
