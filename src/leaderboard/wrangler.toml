@@ -1,0 +1,22 @@
+name = "claude-leaderboard"
+main = "src/worker.js"
+compatibility_date = "2024-12-01"
+
+# Create this KV namespace with: wrangler kv namespace create LEADERBOARD_KV
+# Then paste the ID below
+[vars]
+PLAN_COST = "200"
+
+[[kv_namespaces]]
+binding = "LEADERBOARD_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# For local development:
+# wrangler kv namespace create LEADERBOARD_KV --preview
+# [[kv_namespaces]]
+# binding = "LEADERBOARD_KV"
+# id = "REPLACE_WITH_PREVIEW_ID"
+# preview_id = "REPLACE_WITH_PREVIEW_ID"
+
+[site]
+bucket = "./public"
