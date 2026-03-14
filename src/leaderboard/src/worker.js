@@ -1,13 +1,11 @@
 /**
  * Claude Usage Leaderboard - Cloudflare Worker
  *
- * Serves the dashboard and handles API endpoints for the bookmarklet.
- * Data is stored in Cloudflare KV.
- *
  * KV Keys:
- *   users       -> JSON array of { id, name, team, numPlans }
- *   usage:{id}  -> JSON { amount, pct, timestamp, source }
- *   config      -> JSON { planCost }
+ *   users         -> JSON array of { id, name, team, numPlans }
+ *   usage:{id}    -> JSON { sessionPct, weeklyPct, timestamp, source }
+ *   history:{id}  -> JSON array of { s: sessionPct, w: weeklyPct, t: timestamp } (max 288)
+ *   config        -> JSON { planCost }
  */
 
 export default {
@@ -15,7 +13,6 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // CORS headers for bookmarklet cross-origin requests
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
@@ -27,10 +24,8 @@ export default {
     }
 
     try {
-      // API Routes
       if (path.startsWith('/api/')) {
         const response = await handleApi(path, request, env);
-        // Add CORS headers to all API responses
         const newHeaders = new Headers(response.headers);
         Object.entries(corsHeaders).forEach(([k, v]) => newHeaders.set(k, v));
         return new Response(response.body, {
@@ -39,7 +34,6 @@ export default {
         });
       }
 
-      // Serve static files from KV (site bucket)
       return env.ASSETS
         ? env.ASSETS.fetch(request)
         : new Response('Dashboard not found. Deploy static assets.', { status: 404 });
@@ -52,58 +46,30 @@ export default {
 async function handleApi(path, request, env) {
   const method = request.method;
 
-  // GET /api/data - Full leaderboard data
-  if (path === '/api/data' && method === 'GET') {
-    return getLeaderboardData(env);
-  }
+  if (path === '/api/data' && method === 'GET') return getLeaderboardData(env);
+  if (path === '/api/users' && method === 'GET') return getUsers(env);
+  if (path === '/api/users' && method === 'POST') return addUser(await request.json(), env);
 
-  // GET /api/users - List users
-  if (path === '/api/users' && method === 'GET') {
-    return getUsers(env);
-  }
-
-  // POST /api/users - Add user
-  if (path === '/api/users' && method === 'POST') {
-    return addUser(await request.json(), env);
-  }
-
-  // DELETE /api/users/:id
   if (path.startsWith('/api/users/') && method === 'DELETE') {
     const id = path.split('/api/users/')[1];
     return deleteUser(id, env);
   }
 
-  // POST /api/usage - Log usage (from bookmarklet or manual)
-  if (path === '/api/usage' && method === 'POST') {
-    return logUsage(await request.json(), env);
-  }
+  if (path === '/api/usage' && method === 'POST') return logUsage(await request.json(), env);
 
-  // POST /api/users/:id/plans - Add plans
   if (path.match(/^\/api\/users\/[^/]+\/plans$/) && method === 'POST') {
     const id = path.split('/')[3];
     return addPlans(id, await request.json(), env);
   }
 
-  // POST /api/import - Import full dataset
-  if (path === '/api/import' && method === 'POST') {
-    return importData(await request.json(), env);
-  }
-
-  // GET /api/export - Export full dataset
-  if (path === '/api/export' && method === 'GET') {
-    return exportData(env);
-  }
+  if (path === '/api/import' && method === 'POST') return importData(await request.json(), env);
+  if (path === '/api/export' && method === 'GET') return exportData(env);
 
   return jsonResponse({ error: 'Not found' }, 404);
 }
 
-// ============================================================
-// DATA ACCESS
-// ============================================================
-
 async function getUsers(env) {
-  const users = await kvGet(env, 'users', []);
-  return jsonResponse(users);
+  return jsonResponse(await kvGet(env, 'users', []));
 }
 
 async function addUser(body, env) {
@@ -125,45 +91,52 @@ async function deleteUser(id, env) {
   users = users.filter(u => u.id !== id);
   await kvPut(env, 'users', users);
   await env.LEADERBOARD_KV.delete(`usage:${id}`);
+  await env.LEADERBOARD_KV.delete(`history:${id}`);
   return jsonResponse({ ok: true, removed: user.name });
 }
 
 async function logUsage(body, env) {
-  const { userId, name, pct, amount, source = 'manual' } = body;
+  const { userId, name, sessionPct, weeklyPct, pct, source = 'manual' } = body;
 
-  // Find user by ID or name
   const users = await kvGet(env, 'users', []);
   let user;
-  if (userId) {
-    user = users.find(u => u.id === userId);
-  } else if (name) {
-    user = users.find(u => u.name.toLowerCase() === name.toLowerCase());
+  if (userId) user = users.find(u => u.id === userId);
+  else if (name) user = users.find(u => u.name.toLowerCase() === name.toLowerCase());
+
+  // Auto-create user if not found (from extension/bookmarklet sync)
+  if (!user && name) {
+    const team = body.team || 'NY';
+    const id = 'u_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
+    user = { id, name, team, numPlans: 1 };
+    users.push(user);
+    await kvPut(env, 'users', users);
   }
+  if (!user) return jsonResponse({ error: 'User not found. Provide a name to auto-register.' }, 404);
 
-  if (!user) return jsonResponse({ error: 'User not found. Add user first.' }, 404);
-
-  const planCost = parseInt(env.PLAN_COST || '200');
-  let usagePct, usageAmount;
-
-  if (pct !== undefined) {
-    usagePct = parseFloat(pct);
-    usageAmount = (usagePct / 100) * user.numPlans * planCost;
-  } else if (amount !== undefined) {
-    usageAmount = parseFloat(amount);
-    usagePct = (usageAmount / (user.numPlans * planCost)) * 100;
-  } else {
-    return jsonResponse({ error: 'pct or amount required' }, 400);
-  }
+  // Get existing usage to preserve values not being updated
+  const existing = await kvGet(env, `usage:${user.id}`, {});
 
   const usageData = {
     userId: user.id,
-    pct: usagePct,
-    amount: usageAmount,
+    sessionPct: sessionPct !== undefined ? parseFloat(sessionPct) : (existing.sessionPct || 0),
+    weeklyPct: weeklyPct !== undefined ? parseFloat(weeklyPct) : (pct !== undefined ? parseFloat(pct) : (existing.weeklyPct || 0)),
     timestamp: new Date().toISOString(),
     source,
   };
 
+  // Backwards compat: if only `pct` was sent (old bookmarklet), treat as weeklyPct
+  if (pct !== undefined && weeklyPct === undefined && sessionPct === undefined) {
+    usageData.weeklyPct = parseFloat(pct);
+  }
+
   await kvPut(env, `usage:${user.id}`, usageData);
+
+  // Append to history (capped at 288 entries ≈ 24h at 5min intervals)
+  const history = await kvGet(env, `history:${user.id}`, []);
+  history.push({ s: usageData.sessionPct, w: usageData.weeklyPct, t: usageData.timestamp });
+  if (history.length > 288) history.splice(0, history.length - 288);
+  await kvPut(env, `history:${user.id}`, history);
+
   return jsonResponse({ ok: true, user: user.name, ...usageData });
 }
 
@@ -172,8 +145,7 @@ async function addPlans(id, body, env) {
   const user = users.find(u => u.id === id);
   if (!user) return jsonResponse({ error: 'User not found' }, 404);
 
-  const count = parseInt(body.count) || 1;
-  user.numPlans += count;
+  user.numPlans += parseInt(body.count) || 1;
   await kvPut(env, 'users', users);
   return jsonResponse({ ok: true, name: user.name, numPlans: user.numPlans });
 }
@@ -183,74 +155,86 @@ async function getLeaderboardData(env) {
   const planCost = parseInt(env.PLAN_COST || '200');
 
   const board = await Promise.all(users.map(async (u) => {
-    const usage = await kvGet(env, `usage:${u.id}`, null);
+    const [usage, history] = await Promise.all([
+      kvGet(env, `usage:${u.id}`, null),
+      kvGet(env, `history:${u.id}`, []),
+    ]);
     const budget = u.numPlans * planCost;
-    const used = usage ? usage.amount : 0;
-    const pct = usage ? usage.pct : 0;
+    const sparkline = history.slice(-48);
+    const avgSessionPct = history.length ? history.reduce((s, e) => s + e.s, 0) / history.length : 0;
+    const avgWeeklyPct = history.length ? history.reduce((s, e) => s + e.w, 0) / history.length : 0;
     return {
       ...u,
       budget,
-      used,
-      pct,
+      sessionPct: usage ? (usage.sessionPct || 0) : 0,
+      weeklyPct: usage ? (usage.weeklyPct || usage.pct || 0) : 0,
       lastUpdated: usage ? usage.timestamp : null,
       source: usage ? usage.source : null,
+      sparkline,
+      avgSessionPct,
+      avgWeeklyPct,
     };
   }));
 
-  board.sort((a, b) => b.pct - a.pct);
-
-  // Team stats
-  const nyUsers = board.filter(u => u.team === 'NY');
-  const xyneUsers = board.filter(u => u.team === 'Xyne');
+  function teamStats(teamUsers) {
+    return {
+      members: teamUsers.length,
+      avgSessionPct: teamUsers.length > 0 ? teamUsers.reduce((s, u) => s + u.sessionPct, 0) / teamUsers.length : 0,
+      avgWeeklyPct: teamUsers.length > 0 ? teamUsers.reduce((s, u) => s + u.weeklyPct, 0) / teamUsers.length : 0,
+    };
+  }
 
   return jsonResponse({
     users: board,
     stats: {
       totalUsers: board.length,
       totalBudget: board.reduce((s, u) => s + u.budget, 0),
-      totalSpend: board.reduce((s, u) => s + u.used, 0),
-      avgPct: board.length > 0 ? board.reduce((s, u) => s + u.pct, 0) / board.length : 0,
+      avgSessionPct: board.length > 0 ? board.reduce((s, u) => s + u.sessionPct, 0) / board.length : 0,
+      avgWeeklyPct: board.length > 0 ? board.reduce((s, u) => s + u.weeklyPct, 0) / board.length : 0,
     },
     teams: {
-      NY: {
-        members: nyUsers.length,
-        avgPct: nyUsers.length > 0 ? nyUsers.reduce((s, u) => s + u.pct, 0) / nyUsers.length : 0,
-        totalSpend: nyUsers.reduce((s, u) => s + u.used, 0),
-      },
-      Xyne: {
-        members: xyneUsers.length,
-        avgPct: xyneUsers.length > 0 ? xyneUsers.reduce((s, u) => s + u.pct, 0) / xyneUsers.length : 0,
-        totalSpend: xyneUsers.reduce((s, u) => s + u.used, 0),
-      },
+      NY: teamStats(board.filter(u => u.team === 'NY')),
+      NC: teamStats(board.filter(u => u.team === 'NC')),
+      Xyne: teamStats(board.filter(u => u.team === 'Xyne')),
+      HS: teamStats(board.filter(u => u.team === 'HS')),
     },
     updatedAt: new Date().toISOString(),
   });
 }
 
 async function importData(body, env) {
-  const { users = [], usageLogs = [] } = body;
-  await kvPut(env, 'users', users);
-  for (const log of usageLogs) {
-    if (log.userId) {
-      await kvPut(env, `usage:${log.userId}`, log);
-    }
+  const { users: importedUsers = [], usageLogs = [], histories = {} } = body;
+
+  // Merge: never remove existing users, only add/update
+  const existing = await kvGet(env, 'users', []);
+  const existingMap = new Map(existing.map(u => [u.id, u]));
+  for (const u of importedUsers) {
+    existingMap.set(u.id, u);
   }
-  return jsonResponse({ ok: true, imported: users.length });
+  const merged = Array.from(existingMap.values());
+  await kvPut(env, 'users', merged);
+
+  for (const log of usageLogs) {
+    if (log.userId) await kvPut(env, `usage:${log.userId}`, log);
+  }
+  for (const [userId, history] of Object.entries(histories)) {
+    await kvPut(env, `history:${userId}`, history);
+  }
+  return jsonResponse({ ok: true, imported: importedUsers.length, total: merged.length });
 }
 
 async function exportData(env) {
   const users = await kvGet(env, 'users', []);
   const usageLogs = [];
+  const histories = {};
   for (const u of users) {
     const usage = await kvGet(env, `usage:${u.id}`, null);
     if (usage) usageLogs.push(usage);
+    const history = await kvGet(env, `history:${u.id}`, []);
+    if (history.length) histories[u.id] = history;
   }
-  return jsonResponse({ users, usageLogs });
+  return jsonResponse({ users, usageLogs, histories });
 }
-
-// ============================================================
-// HELPERS
-// ============================================================
 
 async function kvGet(env, key, defaultVal) {
   const val = await env.LEADERBOARD_KV.get(key, 'json');
